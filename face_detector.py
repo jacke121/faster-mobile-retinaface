@@ -1,20 +1,16 @@
 #!/usr/bin/python3
 # -*- coding:utf-8 -*-
 
-import os
-import argparse
+
 import numpy as np
 import mxnet as mx
 from mxnet import nd
 import cv2
 import time
-from queue import Queue
 
 from generate_anchor import generate_anchors_fpn, nonlinear_pred
 from numpy import frombuffer, uint8, concatenate, float32, block, maximum, minimum
 from functools import partial
-
-from threading import Thread
 
 
 class BaseDetection:
@@ -23,10 +19,6 @@ class BaseDetection:
         self.nms_threshold = nms_thd
         self.device = gpu
         self.margin = margin
-
-        self._queue = Queue(4)
-        self.write_queue = self._queue.put_nowait
-        self.read_queue = iter(self._queue.get, b'')
 
         self._nms_wrapper = partial(
             self.non_maximum_suppression, thresh=self.nms_threshold)
@@ -45,14 +37,8 @@ class BaseDetection:
     @staticmethod
     def non_maximum_suppression(dets, thresh):
         """
-        greedily select boxes with high confidence and overlap with current maximum <= thresh
-        rule out overlap >= thresh
         :param dets: [[x1, y1, x2, y2 score]]
-        :param thresh: retain overlap < thresh
-        :return: indexes to keep
         """
-        # thresh = 0.99
-
         x1, y1, x2, y2, scores = dets.T
 
         areas = (x2 - x1 + 1) * (y2 - y1 + 1)
@@ -79,9 +65,6 @@ class BaseDetection:
     def non_maximum_selection(self, x):
         return x[:1]
 
-    # def detect(self, src, **kwargs):
-    #     raise NotImplementedError('Not Implemented Function: detect')
-
     @staticmethod
     def filter_boxes(boxes, min_size, max_size=-1):
         """ Remove all boxes with any side smaller than min_size """
@@ -96,7 +79,7 @@ class BaseDetection:
 
 class MxnetDetectionModel(BaseDetection):
     def __init__(self, prefix, epoch, scale, gpu=-1, thd=0.5, margin=0,
-                 nms_thd=0.4, verbose=False):
+                 nms_thd=0.1, verbose=False):
 
         super().__init__(thd=thd, gpu=gpu, margin=margin, nms_thd=nms_thd, verbose=verbose)
 
@@ -175,90 +158,36 @@ class MxnetDetectionModel(BaseDetection):
 
         return block([deal_with_fpn(fpn, next(out), next(out)) for fpn in self._fpn_anchors])
 
-    def _retina_forward(self, src):
-        ''' ##### Author 1996scarlet@gmail.com
-        Image preprocess and return the forward results.
 
-        Parameters
-        ----------
-        src: ndarray
-            The image batch of shape [H, W, C].
+    def workflow_inference(self):
 
-        scales: list of float
-            The src scales para.
+        vc = cv2.VideoCapture(0)  # 读入视频文件
 
-        Returns
-        -------
-        net_out: list, len = STEP * N
-            If step is 2, each block has [scores, bbox_deltas]
-            Else if step is 3, each block has [scores, bbox_deltas, landmarks]
+        while True:
+            ret,frame=vc.read()
+            st = time.time()
 
-        Usage
-        -----
-        >>> out = self._retina_forward(frame)
-        '''
+            dst = self._rescale(frame)
+            data = nd.array([dst.transpose((2, 0, 1))])
+            db = mx.io.DataBatch(data=(data,))
+            self._forward(db)
+            out= self._solotion()
 
-        # timea = time.perf_counter()
-        dst = self._rescale(src)
-        data = nd.array(dst.transpose((2, 0, 1))[None, ...])
-        db = mx.io.DataBatch(data=(data, ))
-        self._forward(db)
-        return self._solotion()
-        # print(f'inferance: {time.perf_counter() - timeb}')
-
-    def workflow_inference(self, instream):
-        for source in instream:
-            # st = time.perf_counter()
-            frame = frombuffer(source, dtype=uint8).reshape(V_H, V_W, V_C)
-            out = self._retina_forward(frame)
-
-            try:
-                self.write_queue((frame, out))
-            except:
-                nd.waitall()
-                print('Frame queue full', file=sys.stderr)
-
-            # print(f'workflow_inference: {time.perf_counter() - st}')
-
-    def workflow_postprocess(self, outstream=None):
-        for frame, out in self.read_queue:
-            # st = time.perf_counter()
             detach = self._retina_detach(out, self.scale)
-            # dets = self.non_maximum_selection(detach)  # 1.7 us
-            # print(f'workflow_postprocess: {time.perf_counter() - st}')
 
-            if outstream is None:
-                for res in self._nms_wrapper(detach):
-                    st = time.perf_counter()
-                    self.margin_clip(res)
-                    print(f'margin_clip: {time.perf_counter() - st}')
+            for res in self._nms_wrapper(detach):
+                self.margin_clip(res)
+                cv2.rectangle(frame, (res[0], res[1]),
+                              (res[2], res[3]), (255, 255, 0))
 
-                    cv2.rectangle(frame, (res[0], res[1]),
-                                  (res[2], res[3]), (255, 255, 0))
-
-                cv2.imshow('res', frame)
-                cv2.waitKey(1)
-            else:
-                outstream(frame)
-                outstream(res)
+            print(f'net: {time.time() - st}')
+            cv2.imshow('res', frame)
+            cv2.waitKey(1)
 
 
 if __name__ == '__main__':
-    import sys
+    width = 448
+    scale=448/640
+    fd = MxnetDetectionModel("weights/16and32", 0,scale=scale, gpu=-1, margin=0.15)
+    fd.workflow_inference()
 
-    V_W, V_H, V_C = 640, 480, 3
-    BUFFER_SIZE = V_W * V_H * V_C
-
-    read = sys.stdin.buffer.read
-    write = sys.stdout.buffer.write
-    camera = iter(partial(read, BUFFER_SIZE), b'')
-
-    fd = MxnetDetectionModel("weights/16and32", 0,
-                             scale=.4, gpu=0, margin=0.15)
-
-    poster = Thread(target=fd.workflow_postprocess)
-    poster.start()
-
-    infer = Thread(target=fd.workflow_inference, args=(camera,))
-    infer.daemon = True
-    infer.start()
